@@ -12,7 +12,7 @@ pub struct Block {
     pub txs: Vec<Transaction>,
     pub timestamp: u64,
     pub prev_hash: [u8; 32],
-    pub nonce: u64,
+    pub pow: u64,
     pub hash: [u8; 32],
 }
 
@@ -23,7 +23,7 @@ impl Block {
             txs,
             timestamp: now(),
             prev_hash: prev.hash,
-            nonce: 0,
+            pow: 0,
             hash: ZERO_HASH,
         };
 
@@ -37,7 +37,7 @@ impl Block {
             txs: Vec::new(),
             timestamp: 0,
             prev_hash: ZERO_HASH,
-            nonce: 0,
+            pow: 0,
             hash: ZERO_HASH,
         };
 
@@ -50,12 +50,10 @@ impl Block {
         hasher.update(self.index.to_be_bytes());
         hasher.update(self.timestamp.to_be_bytes());
         hasher.update(self.prev_hash);
-        hasher.update(self.nonce.to_be_bytes());
+        hasher.update(self.pow.to_be_bytes());
 
         for tx in &self.txs {
-            hasher.update(tx.from.as_bytes());
-            hasher.update(tx.to.as_bytes());
-            hasher.update(tx.amount.to_be_bytes());
+            hasher.update(tx.hash_bytes());
         }
 
         hasher.finalize().into()
@@ -67,7 +65,7 @@ impl Block {
             if meets_difficulty(&self.hash, difficulty) {
                 break;
             }
-            self.nonce += 1;
+            self.pow += 1;
         }
     }
 
