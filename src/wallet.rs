@@ -2,29 +2,29 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-use crate::{
-    error::WalletError,
-    transaction::{TX_DOMAIN, Transaction},
-};
+use crate::{error::WalletError, transaction::TX_DOMAIN};
 
+/// The public half of a wallet's key pair, identifying an account on the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Address(VerifyingKey);
+pub struct Address([u8; 32]);
 
 impl Address {
-    pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, ed25519_dalek::SignatureError> {
-        VerifyingKey::from_bytes(bytes).map(Self)
-    }
-
+    /// Returns `true` if `signature` is this address's signature over `message`.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
-        self.0.verify_strict(message, signature).is_ok()
+        self.key().verify_strict(message, signature).is_ok()
     }
 
+    /// Returns the raw bytes of the underlying public key.
     pub fn to_bytes(self) -> [u8; 32] {
-        self.0.to_bytes()
+        self.0
+    }
+
+    fn key(&self) -> VerifyingKey {
+        VerifyingKey::from_bytes(&self.0).expect("an Address always holds a valid key")
     }
 }
 
-/// Shows the first four bytes of a wallet address.
+/// Shows an address as the hex of its first four bytes.
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", &hex::encode(self.to_bytes())[..8])
@@ -37,12 +37,17 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    /// Creates a wallet around a freshly generated random key.
     pub fn new() -> Self {
         Self {
             signing_key: SigningKey::generate(&mut rand_core::OsRng),
         }
     }
 
+    /// Creates a wallet whose key is derived deterministically from `seed`.
+    ///
+    /// Reproducible by anyone holding the seed, so it suits demos and tests
+    /// rather than keys that guard real balances.
     pub fn from_seed(seed: &str) -> Self {
         let digest: [u8; 32] = Sha256::digest(seed.as_bytes()).into();
 
@@ -51,23 +56,27 @@ impl Wallet {
         }
     }
 
+    /// Returns the address derived from the wallet's public key.
     pub fn address(&self) -> Address {
-        Address(self.signing_key.verifying_key())
+        Address(self.signing_key.verifying_key().to_bytes())
     }
 
-    pub fn sign_tx(&self, tx: &Transaction) -> Signature {
-        self.sign_bytes(&tx.signing_bytes())
-    }
-
+    /// Signs an off-chain `challenge`, refusing any message that could later
+    /// be replayed as a transaction.
+    ///
+    /// # Errors
+    /// Returns `WalletError::ReservedDomain` if `challenge` opens with the
+    /// transaction domain prefix.
     pub fn sign_challenge(&self, challenge: &[u8]) -> Result<Signature, WalletError> {
         if challenge.starts_with(TX_DOMAIN) {
             return Err(WalletError::ReservedDomain);
         }
 
-        Ok(self.sign_bytes(challenge))
+        Ok(self.sign(challenge))
     }
 
-    fn sign_bytes(&self, message: &[u8]) -> Signature {
+    /// Signs `message` with the wallet's private key.
+    pub fn sign(&self, message: &[u8]) -> Signature {
         self.signing_key.sign(message)
     }
 }
@@ -82,13 +91,7 @@ impl Default for Wallet {
 mod tests {
 
     use super::*;
-
-    #[test]
-    fn addresses_survive_a_round_trip_through_bytes() {
-        // create wallet and extract public key/address
-        let addr = Wallet::from_seed("meow").address();
-        assert_eq!(Address::from_bytes(&addr.to_bytes()).unwrap(), addr);
-    }
+    use crate::transaction::Transaction;
 
     #[test]
     fn a_seed_always_produces_the_same_address() {
@@ -112,7 +115,7 @@ mod tests {
 
         // alice signs her message
         let msg = b"alice pays bob 10 meme coins";
-        let sign = alice.sign_bytes(msg);
+        let sign = alice.sign(msg);
 
         // sign verified by alice's public key
         assert!(alice.address().verify(msg, &sign));
@@ -138,10 +141,10 @@ mod tests {
 
         // mallory dresses a transfer out of alice's address up as a challenge.
         // signing it blindly would hand over a spendable signature
-        let theft = Transaction::new(alice.address(), mallory.address(), 50, 0);
+        let theft = Transaction::transfer_bytes(alice.address(), mallory.address(), 50, 0);
 
         assert_eq!(
-            alice.sign_challenge(&theft.signing_bytes()),
+            alice.sign_challenge(&theft),
             Err(WalletError::ReservedDomain)
         );
     }

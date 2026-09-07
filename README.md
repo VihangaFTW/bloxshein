@@ -2,12 +2,14 @@
 
 A simple proof-of-work blockchain based on [Bitcoin: A Peer-to-Peer Electronic Cash System](https://bitcoin.org/bitcoin.pdf).
 
-Currently under development. End goal is a blockchain simulator in a TUI maybe. The current codebase is inefficient and experimental.
+Currently under development. Current end goal is a local memecoin simulator. The current codebase is experimental.
 
-If you are interested in understanding the code (very straightforward as of writing), you need to be familiar with:
+The code is easier to understand if you are familiar with:
 
+- Rust semantics (duh)
 - basic cybersecurity concepts such as digital signatures and cryptographic hash functions.
 - a high level understanding of a [blockchain](https://www.youtube.com/watch?v=bBC-nXj3Ng4).
+- [Merkle trees](https://en.wikipedia.org/wiki/Merkle_tree), and how a proof shows one item belongs to a set.
 
 ## Demo
 
@@ -36,7 +38,15 @@ to read. Note that the print output shows the first four bytes of an address onl
 4. **Check the blockchain's integrity** Then `is_valid()` replays
    every block from genesis, re-checking hashes, links, signatures, nonces
    and balances.
-5. **Off-chain signing.** A wallet can also sign messages that are not
+5. **A light client verifies a payment.** Every block header is 88 bytes and
+   commits to all the transactions under it through a single merkle root. So a
+   light client can sync headers alone (264 bytes for the three blocks here) and
+   hold no transactions at all. To check that a transfer was really mined, the
+   full node hands it that one transaction plus a merkle proof, which is 2
+   sibling hashes rather than the whole block. The client recomputes the root
+   from them and compares it against the header it already trusts. A forged
+   transaction reaches a different root and is rejected.
+6. **Off-chain signing.** A wallet can also sign messages that are not
    transactions. A login challenge is one example. Mallory tries to abuse
    this by asking alice to sign a challenge. The challenge is really a malicious transfer that moves alice's balance to mallory. Every transaction payload
    starts with a reserved prefix and alice's wallet sees that prefix when it tries to sign and thus refuses to proceed any further.
@@ -59,11 +69,12 @@ cargo test
 - Signed transfers that reject replay attacks
 - Transfer nonces so an accepted transfer cannot be resubmitted
 - Full blockchain integrity check
+- Merkle trees, committing a block's transactions to its header as one root
+- SPV light client that verifies a payment from headers and a merkle proof, holding no transactions
 
 ## Planned Extensions
 
 - difficulty retargeting
-- Merkle trees
 - transaction fees
 - fork-choice rule
 - networking or peers ?!

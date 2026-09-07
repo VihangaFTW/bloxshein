@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use crate::{
-    block::Block,
+    block::{Block, BlockHeader},
     error::{ChainError, TxError},
-    transaction::{Sender, Transaction},
+    transaction::Transaction,
     wallet::Address,
 };
 
+/// A proof of work chain of blocks, with a mempool of transactions waiting to
+/// be mined into the next one.
 #[derive(Debug, Clone)]
 pub struct Blockchain {
     blocks: Vec<Block>,
@@ -17,9 +19,9 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
+    /// Creates a chain holding nothing but a freshly mined genesis block.
     pub fn new(difficulty: u32, mining_reward: u64) -> Self {
-        let mut genesis = Block::genesis();
-        genesis.mine(difficulty);
+        let genesis = Block::genesis(difficulty);
 
         Self {
             blocks: vec![genesis],
@@ -29,31 +31,41 @@ impl Blockchain {
         }
     }
 
+    /// Returns the header of every block in the chain.
+    pub fn headers(&self) -> Vec<BlockHeader> {
+        self.blocks.iter().map(|b| b.header()).collect()
+    }
+
+    /// Returns every block in the chain, from genesis onwards.
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
     }
 
+    /// Returns the number of leading zero bits a block hash must have.
     pub fn difficulty(&self) -> u32 {
         self.difficulty
     }
 
+    /// Returns the mempool of transactions waiting to be mined.
     pub fn pending(&self) -> &[Transaction] {
         &self.pending
     }
 
+    /// Returns the most recently mined block.
     pub fn last_block(&self) -> &Block {
         self.blocks
             .last()
             .expect("chain always has a genesis block")
     }
 
-    /// Returns the nonce an `Address` must use for its next `Transaction`.
+    /// Returns the nonce `address` must use for its next `Transaction`,
+    /// counting both mined and pending transactions it has sent.
     pub fn next_nonce(&self, address: &Address) -> u64 {
         // count sender's past transactions
         let mined = self
             .blocks
             .iter()
-            .flat_map(|b| &b.txs)
+            .flat_map(|b| b.txs())
             .filter(|tx| tx.sent_by(address))
             .count();
 
@@ -64,41 +76,41 @@ impl Blockchain {
         (mined + pending) as u64
     }
 
-    /// Adds a new `Transaction` to the blockchain's mempool.
-    pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), TxError> {
+    /// Queues `tx` to the mempool once it passes every admission rule.
+    ///
+    /// # Errors
+    /// Returns a `TxError` if the signature does not verify, the transaction
+    /// mints coin, the amount is zero, the nonce is not the one expected next,
+    /// or the sender's spendable balance falls short.
+    pub fn queue_tx(&mut self, tx: Transaction) -> Result<(), TxError> {
         // verify tx sender
-        tx.verify_sign()?;
+        tx.verify_transfer()?;
 
-        let from = match tx.from {
-            Sender::Sheinbase => return Err(TxError::MintingNotAllowed),
-            Sender::Account(addr) => addr,
+        let Some(from) = tx.sender() else {
+            return Err(TxError::MintingNotAllowed);
         };
 
-        if tx.amount == 0 {
+        if tx.amount() == 0 {
             return Err(TxError::ZeroAmount);
-        }
-
-        if from == tx.to {
-            return Err(TxError::SelfTransfer);
         }
 
         // nonce prevents a replay attack where an attacker
         // re-broadcasts an accepted transaction to the mempool
         let expected = self.next_nonce(&from);
-        if tx.nonce != expected {
+        if tx.nonce() != expected {
             return Err(TxError::WrongNonce {
                 expected,
-                got: tx.nonce,
+                got: tx.nonce(),
             });
         }
 
         // ensure sender is not overspending
         let available = self.spendable_balance(&from);
 
-        if available < tx.amount {
+        if available < tx.amount() {
             return Err(TxError::InsufficientFunds {
                 available,
-                requested: tx.amount,
+                requested: tx.amount(),
             });
         }
 
@@ -106,11 +118,15 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Delegates all pending transactions in the chain to a miner and returns the resulting `Block`.
+    /// Mines every pending transaction into a new block that pays `miner` the
+    /// mining reward, and returns that block.
+    ///
+    /// An empty mempool is no obstacle: miners are paid for the work of
+    /// finding a valid proof of work.
     pub fn mine_pending(&mut self, miner: &Address) -> &Block {
         // moves ownership and replace with empty vec in one step
         let mut txs: Vec<Transaction> = std::mem::take(&mut self.pending);
-        let height = self.last_block().index + 1;
+        let height = self.last_block().height() + 1;
 
         // it does not matter if there are no pending transactions
         // miners are paid for the work put into finding a valid pow
@@ -119,18 +135,23 @@ impl Blockchain {
         txs.insert(0, Transaction::reward(*miner, self.mining_reward, height));
 
         // mine new block
-        let mut block = Block::new(self.last_block(), txs);
-        block.mine(self.difficulty);
+        let block = Block::new(self.last_block(), txs, self.difficulty);
         self.blocks.push(block);
 
         self.last_block()
     }
 
+    /// Returns the balance `address` holds across mined blocks, ignoring the
+    /// mempool.
+    ///
+    /// # Panics
+    /// Panics if a recorded block holds an unpayable transaction, which the
+    /// chain's invariants forbid.
     pub fn balance_of(&self, address: &Address) -> u64 {
         let mut balances: HashMap<Address, u64> = HashMap::new();
 
         for block in &self.blocks {
-            for tx in &block.txs {
+            for tx in block.txs() {
                 Self::update_balances(&mut balances, tx)
                     .expect("blockchain invariant: recorded blocks contain only valid transactions")
             }
@@ -139,49 +160,55 @@ impl Blockchain {
         balances.get(address).copied().unwrap_or(0)
     }
 
-    /// Returns `address`'s remaining balance after its pending
-    /// outgoing transactions are cleared.
-    /// # Note
-    /// This method ignores any pending incoming funds to `address`.
+    /// Returns the balance left to `address` once its pending outgoing
+    /// transactions are covered.
+    ///
+    /// Pending funds owed *to* `address` do not count towards this.
     pub fn spendable_balance(&self, address: &Address) -> u64 {
         let pending_out: u64 = self
             .pending
             .iter()
             .filter(|tx| tx.sent_by(address))
-            .map(|tx| tx.amount)
+            .map(|tx| tx.amount())
             .sum();
 
         self.balance_of(address).saturating_sub(pending_out)
     }
 
-    /// Updates `balances` in place with `tx`.
-    /// # Error
-    /// Returns `TxError::InsufficientFunds` if the transfer cannot be completed.
+    /// Applies `tx` to `balances` in place.
+    ///
+    /// # Errors
+    /// Returns `TxError::InsufficientFunds` if the sender cannot cover the
+    /// transfer.
     fn update_balances(
         balances: &mut HashMap<Address, u64>,
         tx: &Transaction,
     ) -> Result<(), TxError> {
-        if let Sender::Account(from) = tx.from {
+        if let Some(from) = tx.sender() {
             let balance = balances.entry(from).or_default();
 
             // decrement sender's balance if available
             *balance = balance
-                .checked_sub(tx.amount)
+                .checked_sub(tx.amount())
                 .ok_or(TxError::InsufficientFunds {
                     available: *balance,
-                    requested: tx.amount,
+                    requested: tx.amount(),
                 })?
         }
 
         // increment receiver's balance
         // this path handles rewards as well
-        *balances.entry(tx.to).or_default() += tx.amount;
+        *balances.entry(tx.to()).or_default() += tx.amount();
 
         Ok(())
     }
 
-    /// Replays the whole block chain from genesis, verifying the
-    /// chain's structural and transaction integrity.
+    /// Replays the whole chain from genesis, verifying its structural and
+    /// transaction integrity.
+    ///
+    /// # Errors
+    /// Returns a `ChainError` naming the first block that breaks a structural
+    /// rule, or the first transaction that breaks a ledger rule.
     pub fn validate(&self) -> Result<(), ChainError> {
         // tracks transaction nonces to ensure incremental nonces
         let mut nonces: HashMap<Address, u64> = HashMap::new();
@@ -189,35 +216,40 @@ impl Blockchain {
         let mut balances: HashMap<Address, u64> = HashMap::new();
 
         for (pos, block) in self.blocks.iter().enumerate() {
-            let height = block.index;
+            let height = block.height();
 
             // ============= BLOCK LEVEL VERIFICATION =============
 
-            // block indices must increase by 1
+            // block heights must increase by 1
             if height != pos as u64 {
-                return Err(ChainError::WrongIndex(block.index));
+                return Err(ChainError::WrongHeight(block.height()));
             }
             // block hash must meet difficulty
             if !block.has_valid_hash(self.difficulty) {
-                return Err(ChainError::BrokenHash(block.index));
+                return Err(ChainError::BrokenHash(block.height()));
+            }
+
+            // block root must cover all its txs
+            if !block.has_valid_root() {
+                return Err(ChainError::BrokenRoot(block.height()));
             }
 
             // hash link between two contiguous blocks must be preserved
-            if pos > 0 && block.prev_hash != self.blocks[pos - 1].hash {
-                return Err(ChainError::BrokenLink(block.index));
+            if pos > 0 && block.prev_hash() != self.blocks[pos - 1].hash {
+                return Err(ChainError::BrokenLink(block.height()));
             }
 
             // a valid block start with a reward tx
             if pos > 0 {
-                match block.txs.first() {
+                match block.txs().first() {
                     Some(tx) if tx.is_reward() => {
-                        if tx.amount != self.mining_reward {
+                        if tx.amount() != self.mining_reward {
                             return Err(ChainError::BadTransaction {
                                 height,
                                 slot: 0,
                                 cause: TxError::WrongReward {
                                     expected: self.mining_reward,
-                                    got: tx.amount,
+                                    got: tx.amount(),
                                 },
                             });
                         };
@@ -228,9 +260,9 @@ impl Blockchain {
 
             // ============= TRANSACTION LEVEL VERIFICATION =============
 
-            for (slot, tx) in block.txs.iter().enumerate() {
+            for (slot, tx) in block.txs().iter().enumerate() {
                 // verify sign in transaction
-                if let Some(err) = tx.verify_sign().err() {
+                if let Some(err) = tx.verify_transfer().err() {
                     return Err(ChainError::BadTransaction {
                         height,
                         slot,
@@ -248,25 +280,16 @@ impl Blockchain {
                     });
                 }
 
-                if let Sender::Account(from) = tx.from {
-                    // reject self transfers
-                    if from == tx.to {
-                        return Err(ChainError::BadTransaction {
-                            height,
-                            slot,
-                            cause: TxError::SelfTransfer,
-                        });
-                    }
-
+                if let Some(from) = tx.sender() {
                     // track sender's transaction count
                     let expected = nonces.entry(from).or_default();
-                    if tx.nonce != *expected {
+                    if tx.nonce() != *expected {
                         return Err(ChainError::BadTransaction {
                             height,
                             slot,
                             cause: TxError::WrongNonce {
                                 expected: *expected,
-                                got: tx.nonce,
+                                got: tx.nonce(),
                             },
                         });
                     }
@@ -289,6 +312,7 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Returns `true` if `validate` finds no fault in the chain.
     pub fn is_valid(&self) -> bool {
         self.validate().is_ok()
     }
@@ -304,12 +328,8 @@ mod tests {
         Blockchain::new(8, 50)
     }
 
-    /// Builds a transfer and signs it with the sender's key, which is what
-    /// `add_transaction` and `validate` both demand of an account transaction.
     fn signed(from: &Wallet, to: &Wallet, amount: u64, nonce: u64) -> Transaction {
-        let mut tx = Transaction::new(from.address(), to.address(), amount, nonce);
-        tx.signature = Some(from.sign_tx(&tx));
-        tx
+        Transaction::transfer(from, to.address(), amount, nonce)
     }
 
     #[test]
@@ -317,7 +337,7 @@ mod tests {
         let chain = chain();
 
         assert_eq!(chain.blocks().len(), 1);
-        assert_eq!(chain.last_block().index, 0);
+        assert_eq!(chain.last_block().height(), 0);
         assert!(meets_difficulty(
             &chain.last_block().hash,
             chain.difficulty()
@@ -349,7 +369,7 @@ mod tests {
         chain.mine_pending(&sender.address());
 
         chain
-            .add_transaction(signed(&sender, &receiver, amount, 0))
+            .queue_tx(signed(&sender, &receiver, amount, 0))
             .unwrap();
 
         chain.mine_pending(&miner.address());
@@ -371,7 +391,7 @@ mod tests {
         let receiver = Wallet::from_seed("bob");
         let amount = 100;
 
-        let result = chain.add_transaction(signed(&sender, &receiver, amount, 0));
+        let result = chain.queue_tx(signed(&sender, &receiver, amount, 0));
 
         assert_eq!(
             result,
@@ -393,7 +413,7 @@ mod tests {
         chain.mine_pending(&sender.address());
 
         chain
-            .add_transaction(signed(&sender, &receiver, amount, 0))
+            .queue_tx(signed(&sender, &receiver, amount, 0))
             .unwrap();
 
         assert_eq!(
@@ -405,13 +425,13 @@ mod tests {
         // balance is all that is left to spend
         assert!(
             chain
-                .add_transaction(signed(&sender, &receiver, 100_000, 1))
+                .queue_tx(signed(&sender, &receiver, 100_000, 1))
                 .is_err()
         );
     }
 
     #[test]
-    fn tampering_with_block_tx_breaks_hash() {
+    fn tampering_with_block_tx_breaks_root() {
         let mut chain = chain();
 
         let sender = Wallet::from_seed("alice");
@@ -419,18 +439,15 @@ mod tests {
         chain.mine_pending(&sender.address());
 
         // tampering: sheinbase -> sender : 9999 (instead of 50)
-        chain.blocks[1].txs[0].amount = 9_999;
-        // block's hash should not match with new hash post tamper
-        assert!(!chain.blocks[1].has_valid_hash(chain.difficulty));
-        assert_eq!(chain.validate(), Err(ChainError::BrokenHash(1)));
+        chain.blocks[1].txs_mut()[0] = Transaction::reward(sender.address(), 9_999, 1);
+        // the header is untouched, so its own hash still stands
+        assert!(chain.blocks[1].has_valid_hash(chain.difficulty));
+        assert!(!chain.blocks[1].has_valid_root());
+
+        // block's merkle root does not cover the tampered transaction
+        assert_eq!(chain.validate(), Err(ChainError::BrokenRoot(1)));
     }
 
-    /// Re-mining an edited block repairs that block's own hash, but not the
-    /// copy of it stored in the block that follows.
-    ///
-    /// The edit is a timestamp rather than an amount so that the ledger rules
-    /// stay satisfied: a bumped reward would be caught as `WrongReward` at
-    /// block 1 and the broken link would never be reached.
     #[test]
     fn remining_tampered_block_breaks_next_link() {
         let mut chain = chain();
@@ -444,15 +461,13 @@ mod tests {
         assert!(chain.is_valid());
 
         // tamper with block 1, then re-mine it to find a valid hash
-        chain.blocks[1].timestamp += 3_600;
+        *chain.blocks[1].timestamp_mut() += 3_600;
         chain.blocks[1].mine(chain.difficulty);
 
         // attacker needs to re-mine block 2 as well for chain to be valid
         assert_eq!(chain.validate(), Err(ChainError::BrokenLink(2)));
     }
 
-    /// Redoing *all* the work lines every hash and link back up. Only the
-    /// ledger rules are left to catch the rewrite.
     #[test]
     fn rewriting_the_whole_chain_is_caught_by_the_rules() {
         let mut chain = chain();
@@ -462,9 +477,10 @@ mod tests {
         chain.mine_pending(&sender.address());
         chain.mine_pending(&receiver.address());
 
-        chain.blocks[1].txs[0].amount = 9_999;
+        chain.blocks[1].txs_mut()[0] = Transaction::reward(sender.address(), 9_999, 1);
         for height in 1..chain.blocks.len() {
-            chain.blocks[height].prev_hash = chain.blocks[height - 1].hash;
+            let prev_hash = chain.blocks[height - 1].hash;
+            *chain.blocks[height].prev_hash_mut() = prev_hash;
             chain.blocks[height].mine(chain.difficulty);
         }
 

@@ -1,13 +1,10 @@
+use std::fmt;
+
 use crate::{
-    error::{
-        SignatureError,
-        SignatureError::{Invalid, Missing},
-        TxError,
-    },
-    wallet::Address,
+    error::{SignatureError, TxError},
+    wallet::{Address, Wallet},
 };
 use ed25519_dalek::Signature;
-use std::fmt::{self};
 
 // ensures that nothing signed elsewhere
 // can ever be read as a transaction
@@ -17,128 +14,180 @@ pub(crate) const TX_DOMAIN: &[u8] = b"bloxshein.tx.v1";
 // prefix + tag + from + to + amount + nonce
 const MAX_TX_PAYLOAD: usize = TX_DOMAIN.len() + 1 + 32 + 32 + 8 + 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sender {
-    Sheinbase,
-    Account(Address),
-}
-
+/// A ledger entry: either coin minted by the chain for a miner, or a signed
+/// transfer between two addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Transaction {
-    // prevents replay attacks
-    pub nonce: u64,
-    pub from: Sender,
-    pub to: Address,
-    pub amount: u64,
-    // a reward tx is not signed
-    pub signature: Option<Signature>,
+pub enum Transaction {
+    /// Coin paid to the miner of the block at `height`.
+    Reward {
+        to: Address,
+        amount: u64,
+        height: u64,
+    },
+    /// A payment authorised by the sender's signature over its payload.
+    Transfer {
+        from: Address,
+        to: Address,
+        amount: u64,
+        nonce: u64,
+        signature: Signature,
+    },
 }
 
 impl Transaction {
-    /// Builds an unsigned `Transaction`.
-    pub fn new(from: Address, to: Address, amount: u64, nonce: u64) -> Self {
-        Self {
-            from: Sender::Account(from),
+    /// Builds a transfer of `amount` from `wallet` to `to`, signed with the
+    /// wallet's key.
+    pub fn transfer(wallet: &Wallet, to: Address, amount: u64, nonce: u64) -> Self {
+        let from = wallet.address();
+
+        Self::Transfer {
+            from,
             to,
             amount,
             nonce,
-            signature: None,
+            signature: wallet.sign(Self::transfer_bytes(from, to, amount, nonce).as_slice()),
         }
-    }
-
-    pub fn sent_by(&self, address: &Address) -> bool {
-        self.from == Sender::Account(*address)
-    }
-
-    /// Extracts the transaction's payload into an owned `Vec` of bytes.
-    ///
-    /// Use this method when signing a transaction.
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(MAX_TX_PAYLOAD);
-
-        bytes.extend_from_slice(TX_DOMAIN);
-
-        // add a tag byte for sender variants to
-        // differentiate fields when unpacking
-        // format: sheinbase -> 0, others -> 1
-        match self.from {
-            Sender::Sheinbase => bytes.push(0),
-            Sender::Account(addr) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&addr.to_bytes())
-            }
-        }
-
-        bytes.extend_from_slice(&self.to.to_bytes());
-        bytes.extend_from_slice(&self.amount.to_be_bytes());
-        bytes.extend_from_slice(&self.nonce.to_be_bytes());
-
-        bytes
-    }
-
-    /// Extracts the whole transaction into an owned `Vec` of bytes.
-    ///
-    /// Use this method when hashing a `Transaction`.
-    pub fn hash_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.signing_bytes();
-
-        // the signature is part of a transaction's identity,
-        // so a tag byte marks which of the two shapes this is
-        match &self.signature {
-            Some(s) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&s.to_bytes());
-            }
-            None => bytes.push(0),
-        }
-
-        bytes
     }
 
     pub(crate) fn reward(to: Address, amount: u64, height: u64) -> Self {
-        Self {
-            from: Sender::Sheinbase,
+        Self::Reward { to, amount, height }
+    }
+
+    /// Returns `true` if this is a transfer sent by `address`.
+    pub fn sent_by(&self, address: &Address) -> bool {
+        match self {
+            Transaction::Transfer { from, .. } => from == address,
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a mining reward.
+    pub fn is_reward(&self) -> bool {
+        matches!(self, Self::Reward { .. })
+    }
+
+    /// The sender of a transfer, or `None` for a reward minted by the chain.
+    pub fn sender(&self) -> Option<Address> {
+        match self {
+            Self::Reward { .. } => None,
+            Self::Transfer { from, .. } => Some(*from),
+        }
+    }
+
+    /// Returns the recipient of the transaction.
+    pub fn to(&self) -> Address {
+        match self {
+            Self::Reward { to, .. } | Self::Transfer { to, .. } => *to,
+        }
+    }
+
+    /// Returns the amount transferred, or the size of the reward.
+    pub fn amount(&self) -> u64 {
+        match self {
+            Self::Reward { amount, .. } | Self::Transfer { amount, .. } => *amount,
+        }
+    }
+
+    /// Returns the sender's nonce, or the block height for a reward.
+    pub fn nonce(&self) -> u64 {
+        match self {
+            Self::Reward { height, .. } => *height,
+            Self::Transfer { nonce, .. } => *nonce,
+        }
+    }
+
+    /// Verifies that a transfer was authorised by its sender. A reward carries
+    /// no signature and is always accepted.
+    ///
+    /// # Errors
+    /// Returns `TxError::SelfTransfer` if sender and recipient are the same
+    /// address, or `TxError::Signature` if the signature does not verify under
+    /// the sender's address.
+    pub fn verify_transfer(&self) -> Result<(), TxError> {
+        if let Self::Transfer {
+            from,
             to,
             amount,
-            nonce: height,
-            signature: None,
-        }
-    }
-
-    pub fn is_reward(&self) -> bool {
-        self.from == Sender::Sheinbase
-    }
-
-    /// Verifies whether the transaction was authorised by its sender.
-    pub fn verify_sign(&self) -> Result<(), TxError> {
-        match (self.from, &self.signature) {
-            (Sender::Sheinbase, None) => Ok(()),
-            (Sender::Sheinbase, Some(_)) => Err(TxError::Signature(
-                SignatureError::SignedSheinbase(self.nonce),
-            )),
-            (Sender::Account(addr), Some(s)) => {
-                if addr.verify(&self.signing_bytes(), s) {
-                    Ok(())
-                } else {
-                    Err(TxError::Signature(Invalid(self.nonce)))
-                }
+            nonce,
+            signature,
+        } = self
+        {
+            if from == to {
+                return Err(TxError::SelfTransfer);
             }
-            (Sender::Account(_), None) => Err(TxError::Signature(Missing(self.nonce))),
+
+            let message = Self::transfer_bytes(*from, *to, *amount, *nonce);
+
+            if !from.verify(&message, signature) {
+                return Err(TxError::Signature(SignatureError::Invalid(*nonce)));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transfer_bytes(from: Address, to: Address, amount: u64, nonce: u64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(MAX_TX_PAYLOAD);
+
+        bytes.extend_from_slice(TX_DOMAIN);
+        bytes.push(1);
+        bytes.extend_from_slice(&from.to_bytes());
+        bytes.extend_from_slice(&to.to_bytes());
+        bytes.extend_from_slice(&amount.to_be_bytes());
+        bytes.extend_from_slice(&nonce.to_be_bytes());
+
+        bytes
+    }
+
+    fn reward_bytes(to: Address, amount: u64, nonce: u64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(MAX_TX_PAYLOAD);
+
+        bytes.extend_from_slice(TX_DOMAIN);
+        bytes.push(0);
+        bytes.extend_from_slice(&to.to_bytes());
+        bytes.extend_from_slice(&amount.to_be_bytes());
+        bytes.extend_from_slice(&nonce.to_be_bytes());
+
+        bytes
+    }
+
+    /// Returns the transaction's canonical payload.
+    pub(crate) fn payload_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Transfer {
+                from,
+                to,
+                amount,
+                nonce,
+                ..
+            } => Self::transfer_bytes(*from, *to, *amount, *nonce),
+            Self::Reward { to, amount, height } => Self::reward_bytes(*to, *amount, *height),
         }
     }
-}
 
-impl fmt::Display for Sender {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Returns the transaction's canonical payload
+    /// followed by the signature, if any.
+    pub(crate) fn hash_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.payload_bytes();
+
         match self {
-            Self::Sheinbase => write!(f, " Sheinbase"),
-            Self::Account(addr) => write!(f, "{addr}"),
+            Self::Transfer { signature, .. } => {
+                bytes.push(1);
+                bytes.extend_from_slice(&signature.to_bytes());
+            }
+            Self::Reward { .. } => bytes.push(0),
         }
+
+        bytes
     }
 }
 
 impl fmt::Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} -> {}: {}", self.from, self.to, self.amount)
+        match self {
+            Self::Reward { to, amount, .. } => write!(f, "Sheinbase -> {to}: {amount}"),
+            Self::Transfer {
+                from, to, amount, ..
+            } => write!(f, "{from} -> {to}: {amount}"),
+        }
     }
 }

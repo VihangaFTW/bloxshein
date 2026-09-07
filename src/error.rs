@@ -2,6 +2,7 @@ use std::fmt;
 
 // ============= WALLET =============
 
+/// Reasons a `Wallet` refuses to sign.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletError {
     ReservedDomain,
@@ -17,10 +18,9 @@ impl fmt::Display for WalletError {
 
 // ============= TRANSACTION =============
 
+/// Reasons a signature fails to verify.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureError {
-    SignedSheinbase(u64),
-    Missing(u64),
     Invalid(u64),
 }
 
@@ -28,12 +28,12 @@ impl fmt::Display for SignatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(id) => write!(f, "invalid signature in transaction {id}"),
-            Self::Missing(id) => write!(f, "missing signature in transaction {id}"),
-            Self::SignedSheinbase(id) => write!(f, "sign found in reward transaction {id}"),
         }
     }
 }
 
+/// Reasons a `Transaction` is rejected, whether at admission to the mempool or
+/// during chain validation.
 #[derive(Debug, PartialEq, Clone)]
 pub enum TxError {
     ZeroAmount,
@@ -83,11 +83,13 @@ impl From<SignatureError> for TxError {
 
 // ============= BLOCKCHAIN =============
 
+/// Reasons a `Blockchain` fails validation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainError {
     // structural errors in the blockchain
-    WrongIndex(u64),
+    WrongHeight(u64),
     BrokenHash(u64),
+    BrokenRoot(u64),
     BrokenLink(u64),
     MissingReward(u64),
     // a transaction breaking a rule that would also reject it at admission
@@ -107,7 +109,11 @@ impl fmt::Display for ChainError {
             ChainError::BrokenHash(h) => {
                 write!(f, "block {h} hash does not match mining difficulty")
             }
-            ChainError::WrongIndex(h) => write!(f, "invalid index for block {h}"),
+            ChainError::BrokenRoot(h) => write!(
+                f,
+                "merkle root of block {h} does not cover its transactions"
+            ),
+            ChainError::WrongHeight(h) => write!(f, "invalid height for block {h}"),
             ChainError::MissingReward(h) => write!(f, "missing reward transaction in block {h}"),
             ChainError::BadTransaction {
                 height,

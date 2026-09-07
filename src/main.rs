@@ -1,5 +1,6 @@
 use crate::{
     blockchain::Blockchain,
+    spv::LightClient,
     transaction::Transaction,
     wallet::{Address, Wallet},
 };
@@ -7,6 +8,8 @@ use crate::{
 mod block;
 mod blockchain;
 mod error;
+mod merkle;
+mod spv;
 mod transaction;
 mod wallet;
 
@@ -60,17 +63,68 @@ fn main() {
     println!("\nchain");
     for block in chain.blocks() {
         println!(
-            "  #{} nonce {:<8} hash {}  ({} tx)",
-            block.index,
-            block.pow,
+            "  #{} nonce {:<8} hash {}  root {}  ({} tx)",
+            block.height(),
+            block.header.pow,
             &hex::encode(block.hash)[..16],
-            block.txs.len()
+            &hex::encode(block.root())[..16],
+            block.txs().len()
         );
     }
 
     println!("\nvalid: {}", chain.is_valid());
 
+    light_client(&chain);
+
     off_chain_signing(&chain, &alice, &mallory);
+}
+
+/// A light client holds headers only, and still verifies that a transaction
+/// was mined: the full node hands it a merkle proof, and the root inside the
+/// header it already trusts is enough to check it.
+fn light_client(chain: &Blockchain) {
+    println!("\nlight client");
+
+    let headers = chain.headers();
+    println!(
+        "  syncing {} headers ({} bytes) instead of {} transactions",
+        headers.len(),
+        headers.len() * 88,
+        chain.blocks().iter().map(|b| b.txs().len()).sum::<usize>()
+    );
+
+    let client = match LightClient::sync(headers, DIFFICULTY) {
+        Ok(client) => client,
+        Err(e) => return println!("  headers rejected ({e})"),
+    };
+
+    // the full node picks a transaction and proves it belongs to its block
+    let block = chain.last_block();
+    let tx = &block.txs()[1];
+    let proof = block.proof_for(tx).expect("a recorded tx has a proof");
+
+    println!(
+        "  block #{} holds it: {}",
+        block.height(),
+        block.contains(tx)
+    );
+    println!(
+        "  proving {tx} with {} sibling hash(es) instead of {} transactions",
+        proof.len(),
+        block.txs().len()
+    );
+    println!(
+        "  verified against header #{} alone: {}",
+        block.height(),
+        client.verify_tx(tx, block.height(), &proof)
+    );
+
+    // a transaction that was never mined has no path to the same root
+    let forged = Transaction::reward(Wallet::from_seed("mallory").address(), 9_999, 2);
+    println!(
+        "  forged transaction verifies: {}",
+        client.verify_tx(&forged, block.height(), &proof)
+    );
 }
 
 /// A wallet signs off-chain messages too, so it has to make sure it is never
@@ -92,7 +146,7 @@ fn off_chain_signing(chain: &Blockchain, alice: &Wallet, mallory: &Wallet) {
 
     // mallory hands alice a "challenge" that is really the payload of a
     // transfer draining alice's balance into mallory's address
-    let theft = Transaction::new(
+    let theft = Transaction::transfer_bytes(
         alice.address(),
         mallory.address(),
         chain.balance_of(&alice.address()),
@@ -100,17 +154,15 @@ fn off_chain_signing(chain: &Blockchain, alice: &Wallet, mallory: &Wallet) {
     );
 
     // the domain prefix is what gives it away
-    match alice.sign_challenge(&theft.signing_bytes()) {
-        Ok(_) => println!("  disguised transfer signed: {theft}"),
-        Err(e) => println!("  disguised transfer refused ({e}): {theft}"),
+    match alice.sign_challenge(&theft) {
+        Ok(_) => println!("  disguised transfer signed"),
+        Err(e) => println!("  disguised transfer refused ({e})"),
     }
 }
 
 /// Builds a transfer and signs it with the sender's key.
 fn signed(from: &Wallet, to: Address, amount: u64, nonce: u64) -> Transaction {
-    let mut tx = Transaction::new(from.address(), to, amount, nonce);
-    tx.signature = Some(from.sign_tx(&tx));
-    tx
+    Transaction::transfer(from, to, amount, nonce)
 }
 
 fn mine(chain: &mut Blockchain, miner: &Address) {
@@ -120,15 +172,15 @@ fn mine(chain: &mut Blockchain, miner: &Address) {
 
     println!(
         "  block #{} mined in {:?} after {} hashes -> {}",
-        block.index,
+        block.height(),
         start.elapsed(),
-        block.pow,
+        block.header.pow,
         hex::encode(block.hash)
     );
 }
 
 fn submit(chain: &mut Blockchain, tx: Transaction) {
-    match chain.add_transaction(tx.clone()) {
+    match chain.queue_tx(tx.clone()) {
         Ok(()) => println!(" queued {tx}"),
         Err(e) => println!(" rejected {tx} ({e})"),
     }
