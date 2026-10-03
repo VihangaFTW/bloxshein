@@ -69,12 +69,12 @@ cargo test
 - Signed transfers that reject replay attacks
 - Transfer nonces so an accepted transfer cannot be resubmitted
 - Full blockchain integrity check
-- Merkle trees, committing a block's transactions to its header as one root
-- SPV light client that verifies a payment from headers and a merkle proof, holding no transactions
+- Merkle trees
+- SPV light client that verifies a payment from headers and a merkle proof
+- Transaction fees
 
 ## Planned Extensions
 
 - difficulty retargeting
-- transaction fees
 - fork-choice rule
 - networking or peers ?!
