@@ -7,11 +7,19 @@ use crate::{
     wallet::Address,
 };
 
+/// Cache of current balances and next transaction nonce for each `Address` on the `BlockChain`.
+#[derive(Debug, Clone, Default)]
+struct State {
+    balances: HashMap<Address, u64>,
+    nonces: HashMap<Address, u64>,
+}
+
 /// A proof of work chain of blocks, with a mempool of transactions waiting to
 /// be mined into the next one.
 #[derive(Debug, Clone)]
 pub struct Blockchain {
     blocks: Vec<Block>,
+    state: State,
     /// Mempool of transactions waiting to be recorded in a `Block`.
     pending: Vec<Transaction>,
     difficulty: u32,
@@ -25,6 +33,7 @@ impl Blockchain {
 
         Self {
             blocks: vec![genesis],
+            state: State::default(),
             pending: Vec::new(),
             difficulty,
             mining_reward,
@@ -58,22 +67,19 @@ impl Blockchain {
             .expect("chain always has a genesis block")
     }
 
+    /// Returns the balance `address` holds across mined blocks, ignoring the
+    /// mempool.
+    pub fn balance_of(&self, address: &Address) -> u64 {
+        self.state.balances.get(address).copied().unwrap_or(0)
+    }
+
     /// Returns the nonce `address` must use for its next `Transaction`,
     /// counting both mined and pending transactions it has sent.
     pub fn next_nonce(&self, address: &Address) -> u64 {
-        // count sender's past transactions
-        let mined = self
-            .blocks
-            .iter()
-            .flat_map(|b| b.txs())
-            .filter(|tx| tx.sent_by(address))
-            .count();
+        let mined = self.state.nonces.get(address).copied().unwrap_or(0);
+        let pending = self.pending.iter().filter(|tx| tx.sent_by(address)).count() as u64;
 
-        // count pending transactions by same sender
-        let pending = self.pending.iter().filter(|tx| tx.sent_by(address)).count();
-        // an address's nonce is the count of transactions it has sent
-        // this is Etherium' account model
-        (mined + pending) as u64
+        mined + pending
     }
 
     /// Queues `tx` to the mempool once it passes every admission rule.
@@ -120,9 +126,6 @@ impl Blockchain {
 
     /// Mines every pending transaction into a new block that pays `miner` the
     /// mining reward, and returns that block.
-    ///
-    /// An empty mempool is no obstacle: miners are paid for the work of
-    /// finding a valid proof of work.
     pub fn mine_pending(&mut self, miner: &Address) -> &Block {
         // moves ownership and replace with empty vec in one step
         let mut txs: Vec<Transaction> = std::mem::take(&mut self.pending);
@@ -134,30 +137,22 @@ impl Blockchain {
         // reward tx always first tx in a block
         txs.insert(0, Transaction::reward(*miner, self.mining_reward, height));
 
+        // update balance and nonce cache for all parties in the block's txs
+        for tx in txs.iter() {
+            Self::update_balances(&mut self.state.balances, tx)
+                .expect("blockchain invariant: queued transactions are always payable");
+
+            // update nonce for sender's next tx
+            if let Some(sender) = tx.sender() {
+                *self.state.nonces.entry(sender).or_default() += 1;
+            }
+        }
+
         // mine new block
         let block = Block::new(self.last_block(), txs, self.difficulty);
         self.blocks.push(block);
 
         self.last_block()
-    }
-
-    /// Returns the balance `address` holds across mined blocks, ignoring the
-    /// mempool.
-    ///
-    /// # Panics
-    /// Panics if a recorded block holds an unpayable transaction, which the
-    /// chain's invariants forbid.
-    pub fn balance_of(&self, address: &Address) -> u64 {
-        let mut balances: HashMap<Address, u64> = HashMap::new();
-
-        for block in &self.blocks {
-            for tx in block.txs() {
-                Self::update_balances(&mut balances, tx)
-                    .expect("blockchain invariant: recorded blocks contain only valid transactions")
-            }
-        }
-
-        balances.get(address).copied().unwrap_or(0)
     }
 
     /// Returns the balance left to `address` once its pending outgoing
@@ -184,6 +179,7 @@ impl Blockchain {
         balances: &mut HashMap<Address, u64>,
         tx: &Transaction,
     ) -> Result<(), TxError> {
+        // None for reward tx only
         if let Some(from) = tx.sender() {
             let balance = balances.entry(from).or_default();
 
@@ -210,6 +206,8 @@ impl Blockchain {
     /// Returns a `ChainError` naming the first block that breaks a structural
     /// rule, or the first transaction that breaks a ledger rule.
     pub fn validate(&self) -> Result<(), ChainError> {
+        //? NOTE: we still build balances and nonces maps here
+        //? because we must verify chain independently of the cache state
         // tracks transaction nonces to ensure incremental nonces
         let mut nonces: HashMap<Address, u64> = HashMap::new();
         // tracks the latest available balance per address
@@ -495,5 +493,62 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn cached_state_matches_full_replay() {
+        let mut chain = chain();
+
+        let sender = Wallet::from_seed("vihanga");
+        let receiver = Wallet::from_seed("meowsies");
+        let miner = Wallet::from_seed("mr.miner");
+
+        chain.mine_pending(&sender.address());
+
+        for _ in 0..3 {
+            let nonce = chain.next_nonce(&sender.address());
+            chain
+                .queue_tx(signed(&sender, &receiver, 10, nonce))
+                .unwrap();
+        }
+        chain.mine_pending(&miner.address());
+
+        let nonce = chain.next_nonce(&receiver.address());
+        chain
+            .queue_tx(signed(&receiver, &sender, 10, nonce))
+            .unwrap();
+        chain.mine_pending(&miner.address());
+
+        assert!(chain.validate().is_ok());
+
+        let mut balances: HashMap<Address, u64> = HashMap::new();
+        let mut nonces: HashMap<Address, u64> = HashMap::new();
+
+        for block in chain.blocks() {
+            for tx in block.txs() {
+                Blockchain::update_balances(&mut balances, tx).unwrap();
+                if let Some(from) = tx.sender() {
+                    *nonces.entry(from).or_default() += 1;
+                }
+            }
+        }
+
+        for addr in [sender.address(), receiver.address(), miner.address()] {
+            assert_eq!(
+                chain.balance_of(&addr),
+                balances.get(&addr).copied().unwrap_or(0)
+            );
+            assert_eq!(
+                chain.next_nonce(&addr),
+                nonces.get(&addr).copied().unwrap_or(0)
+            );
+        }
+
+        assert_eq!(chain.balance_of(&sender.address()), 30);
+        assert_eq!(chain.balance_of(&receiver.address()), 20);
+        assert_eq!(chain.balance_of(&miner.address()), 100);
+        assert_eq!(chain.next_nonce(&sender.address()), 3);
+        assert_eq!(chain.next_nonce(&receiver.address()), 1);
+        assert_eq!(chain.next_nonce(&miner.address()), 0);
     }
 }
