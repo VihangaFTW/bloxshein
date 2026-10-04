@@ -68,7 +68,7 @@ mod tests {
     const DIFFICULTY: u32 = 8;
 
     fn chain() -> Blockchain {
-        let mut chain = Blockchain::new(DIFFICULTY, 50);
+        let mut chain = Blockchain::new(DIFFICULTY, 50, 0);
 
         let alice = Wallet::from_seed("alice");
         let bob = Wallet::from_seed("bob");
@@ -76,10 +76,10 @@ mod tests {
 
         chain.mine_pending(&alice.address());
         chain
-            .queue_tx(Transaction::transfer(&alice, bob.address(), 10, 0))
+            .queue_tx(Transaction::transfer(&alice, bob.address(), 10, 0, 0))
             .unwrap();
         chain
-            .queue_tx(Transaction::transfer(&alice, carol.address(), 5, 1))
+            .queue_tx(Transaction::transfer(&alice, carol.address(), 5, 0, 1))
             .unwrap();
         chain.mine_pending(&bob.address());
 

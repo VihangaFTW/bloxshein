@@ -1,22 +1,29 @@
 use std::fmt;
 
 use crate::{
-    error::{SignatureError, TxError},
+    error::{
+        SignatureError,
+        TxError::{self},
+    },
     wallet::{Address, Wallet},
 };
 use ed25519_dalek::Signature;
 
 // ensures that nothing signed elsewhere
 // can ever be read as a transaction
-pub(crate) const TX_DOMAIN: &[u8] = b"bloxshein.tx.v1";
+pub(crate) const TX_DOMAIN: &[u8] = b"bloxshein.tx.v2";
+
+// 1 coin =  10^8 units
+// used to represent fractional amounts in the chain
+pub(crate) const UNIT: u64 = 100_000_000;
 
 // byte count of the largest Transaction payload
-// prefix + tag + from + to + amount + nonce
-const MAX_TX_PAYLOAD: usize = TX_DOMAIN.len() + 1 + 32 + 32 + 8 + 8;
+// prefix + tag + from + to + amount + nonce + fee
+const MAX_TX_PAYLOAD: usize = TX_DOMAIN.len() + 1 + 32 + 32 + 8 + 8 + 8;
 
 /// A ledger entry: either coin minted by the chain for a miner, or a signed
 /// transfer between two addresses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Transaction {
     /// Coin paid to the miner of the block at `height`.
     Reward {
@@ -30,6 +37,8 @@ pub enum Transaction {
         to: Address,
         amount: u64,
         nonce: u64,
+        // sender determines the fee. Miner prioritizes mining txs with higher fees.
+        fee: u64,
         signature: Signature,
     },
 }
@@ -37,7 +46,7 @@ pub enum Transaction {
 impl Transaction {
     /// Builds a transfer of `amount` from `wallet` to `to`, signed with the
     /// wallet's key.
-    pub fn transfer(wallet: &Wallet, to: Address, amount: u64, nonce: u64) -> Self {
+    pub fn transfer(wallet: &Wallet, to: Address, amount: u64, fee: u64, nonce: u64) -> Self {
         let from = wallet.address();
 
         Self::Transfer {
@@ -45,12 +54,20 @@ impl Transaction {
             to,
             amount,
             nonce,
-            signature: wallet.sign(Self::transfer_bytes(from, to, amount, nonce).as_slice()),
+            fee,
+            signature: wallet.sign(Self::transfer_bytes(from, to, amount, fee, nonce).as_slice()),
         }
     }
 
     pub(crate) fn reward(to: Address, amount: u64, height: u64) -> Self {
         Self::Reward { to, amount, height }
+    }
+
+    pub(crate) fn fee(&self) -> u64 {
+        match self {
+            Self::Reward { .. } => 0,
+            Self::Transfer { fee, .. } => *fee,
+        }
     }
 
     /// Returns `true` if this is a transfer sent by `address`.
@@ -109,6 +126,7 @@ impl Transaction {
             to,
             amount,
             nonce,
+            fee,
             signature,
         } = self
         {
@@ -116,7 +134,7 @@ impl Transaction {
                 return Err(TxError::SelfTransfer);
             }
 
-            let message = Self::transfer_bytes(*from, *to, *amount, *nonce);
+            let message = Self::transfer_bytes(*from, *to, *amount, *fee, *nonce);
 
             if !from.verify(&message, signature) {
                 return Err(TxError::Signature(SignatureError::Invalid(*nonce)));
@@ -125,7 +143,13 @@ impl Transaction {
         Ok(())
     }
 
-    pub(crate) fn transfer_bytes(from: Address, to: Address, amount: u64, nonce: u64) -> Vec<u8> {
+    pub(crate) fn transfer_bytes(
+        from: Address,
+        to: Address,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(MAX_TX_PAYLOAD);
 
         bytes.extend_from_slice(TX_DOMAIN);
@@ -134,6 +158,7 @@ impl Transaction {
         bytes.extend_from_slice(&to.to_bytes());
         bytes.extend_from_slice(&amount.to_be_bytes());
         bytes.extend_from_slice(&nonce.to_be_bytes());
+        bytes.extend_from_slice(&fee.to_be_bytes());
 
         bytes
     }
@@ -158,8 +183,9 @@ impl Transaction {
                 to,
                 amount,
                 nonce,
+                fee,
                 ..
-            } => Self::transfer_bytes(*from, *to, *amount, *nonce),
+            } => Self::transfer_bytes(*from, *to, *amount, *fee, *nonce),
             Self::Reward { to, amount, height } => Self::reward_bytes(*to, *amount, *height),
         }
     }

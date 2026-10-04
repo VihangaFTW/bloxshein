@@ -15,6 +15,7 @@ mod wallet;
 
 const DIFFICULTY: u32 = 6;
 const MINING_REWARD: u64 = 50;
+const MIN_FEE: u64 = 1;
 
 fn main() {
     let alice = Wallet::from_seed("alice");
@@ -33,7 +34,7 @@ fn main() {
         ("mallory", mallory.address()),
     ];
 
-    let mut chain = Blockchain::new(DIFFICULTY, MINING_REWARD);
+    let mut chain = Blockchain::new(DIFFICULTY, MINING_REWARD, MIN_FEE);
 
     println!(
         "bloxshein — difficulty {}, reward {MINING_REWARD}\n",
@@ -45,9 +46,9 @@ fn main() {
 
     println!("running some transactions...");
 
-    submit(&mut chain, signed(&alice, bob.address(), 30, 0));
-    submit(&mut chain, signed(&alice, carol.address(), 15, 1));
-    submit(&mut chain, signed(&alice, dave.address(), 100, 2));
+    submit(&mut chain, signed(&alice, bob.address(), 30, 1, 0));
+    submit(&mut chain, signed(&alice, carol.address(), 15, 2, 1));
+    submit(&mut chain, signed(&alice, dave.address(), 100, 1, 2));
 
     println!(
         "\nbob mines {} pending transaction(s)",
@@ -150,6 +151,7 @@ fn off_chain_signing(chain: &Blockchain, alice: &Wallet, mallory: &Wallet) {
         alice.address(),
         mallory.address(),
         chain.balance_of(&alice.address()),
+        0,
         chain.next_nonce(&alice.address()),
     );
 
@@ -161,8 +163,8 @@ fn off_chain_signing(chain: &Blockchain, alice: &Wallet, mallory: &Wallet) {
 }
 
 /// Builds a transfer and signs it with the sender's key.
-fn signed(from: &Wallet, to: Address, amount: u64, nonce: u64) -> Transaction {
-    Transaction::transfer(from, to, amount, nonce)
+fn signed(from: &Wallet, to: Address, amount: u64, fee: u64, nonce: u64) -> Transaction {
+    Transaction::transfer(from, to, amount, fee, nonce)
 }
 
 fn mine(chain: &mut Blockchain, miner: &Address) {

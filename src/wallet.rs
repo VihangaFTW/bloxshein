@@ -141,7 +141,7 @@ mod tests {
 
         // mallory dresses a transfer out of alice's address up as a challenge.
         // signing it blindly would hand over a spendable signature
-        let theft = Transaction::transfer_bytes(alice.address(), mallory.address(), 50, 0);
+        let theft = Transaction::transfer_bytes(alice.address(), mallory.address(), 50, 0, 0);
 
         assert_eq!(
             alice.sign_challenge(&theft),

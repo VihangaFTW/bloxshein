@@ -38,6 +38,8 @@ impl fmt::Display for SignatureError {
 pub enum TxError {
     ZeroAmount,
     SelfTransfer,
+    LowFee { min: u64, got: u64 },
+    AmountOverflow,
     InsufficientFunds { available: u64, requested: u64 },
     WrongNonce { expected: u64, got: u64 },
     WrongReward { expected: u64, got: u64 },
@@ -55,6 +57,10 @@ impl fmt::Display for TxError {
             } => write!(f, "insufficient funds: have {available}, need {requested}"),
             TxError::SelfTransfer => write!(f, "sender and recipient must differ"),
             TxError::ZeroAmount => write!(f, "amount must be greater than zero"),
+            TxError::LowFee { min, got } => {
+                write!(f, "fee too low: minimum {min}, got {got}")
+            }
+            TxError::AmountOverflow => write!(f, "amount plus fee overflows"),
             TxError::WrongNonce { expected, got } => {
                 write!(
                     f,

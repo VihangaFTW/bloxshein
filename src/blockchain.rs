@@ -24,11 +24,12 @@ pub struct Blockchain {
     pending: Vec<Transaction>,
     difficulty: u32,
     mining_reward: u64,
+    min_fee: u64,
 }
 
 impl Blockchain {
     /// Creates a chain holding nothing but a freshly mined genesis block.
-    pub fn new(difficulty: u32, mining_reward: u64) -> Self {
+    pub fn new(difficulty: u32, mining_reward: u64, min_fee: u64) -> Self {
         let genesis = Block::genesis(difficulty);
 
         Self {
@@ -37,6 +38,7 @@ impl Blockchain {
             pending: Vec::new(),
             difficulty,
             mining_reward,
+            min_fee,
         }
     }
 
@@ -100,6 +102,20 @@ impl Blockchain {
             return Err(TxError::ZeroAmount);
         }
 
+        // ensure tx meets chain's min tx fee
+        if tx.fee() < self.min_fee {
+            return Err(TxError::LowFee {
+                min: self.min_fee,
+                got: tx.fee(),
+            });
+        }
+
+        // ensure total cost for sender doesnt overflow
+        let cost = tx
+            .amount()
+            .checked_add(tx.fee())
+            .ok_or(TxError::AmountOverflow)?;
+
         // nonce prevents a replay attack where an attacker
         // re-broadcasts an accepted transaction to the mempool
         let expected = self.next_nonce(&from);
@@ -113,10 +129,10 @@ impl Blockchain {
         // ensure sender is not overspending
         let available = self.spendable_balance(&from);
 
-        if available < tx.amount() {
+        if available < cost {
             return Err(TxError::InsufficientFunds {
                 available,
-                requested: tx.amount(),
+                requested: cost,
             });
         }
 
@@ -134,8 +150,13 @@ impl Blockchain {
         // it does not matter if there are no pending transactions
         // miners are paid for the work put into finding a valid pow
 
+        // sum up tx fees for miner
+        let reward = Self::block_fees(&txs)
+            .and_then(|fees| self.mining_reward.checked_add(fees))
+            .expect("blockchain invariant: reward and fees fit in u64");
+
         // reward tx always first tx in a block
-        txs.insert(0, Transaction::reward(*miner, self.mining_reward, height));
+        txs.insert(0, Transaction::reward(*miner, reward, height));
 
         // update balance and nonce cache for all parties in the block's txs
         for tx in txs.iter() {
@@ -164,14 +185,21 @@ impl Blockchain {
             .pending
             .iter()
             .filter(|tx| tx.sent_by(address))
-            .map(|tx| tx.amount())
-            .sum();
+            .fold(0u64, |acc, tx| {
+                acc.saturating_add(tx.amount().saturating_add(tx.fee()))
+            });
 
         self.balance_of(address).saturating_sub(pending_out)
     }
 
+    /// Sums the fees paid by the transfers in `txs`, or `None` on overflow.
+    fn block_fees(txs: &[Transaction]) -> Option<u64> {
+        txs.iter()
+            .try_fold(0u64, |acc, tx| acc.checked_add(tx.fee()))
+    }
+
     /// Applies `tx` to `balances` in place.
-    ///
+    /// 
     /// # Errors
     /// Returns `TxError::InsufficientFunds` if the sender cannot cover the
     /// transfer.
@@ -181,14 +209,18 @@ impl Blockchain {
     ) -> Result<(), TxError> {
         // None for reward tx only
         if let Some(from) = tx.sender() {
+            let cost = tx
+                .amount()
+                .checked_add(tx.fee())
+                .ok_or(TxError::AmountOverflow)?;
             let balance = balances.entry(from).or_default();
 
             // decrement sender's balance if available
             *balance = balance
-                .checked_sub(tx.amount())
+                .checked_sub(cost)
                 .ok_or(TxError::InsufficientFunds {
                     available: *balance,
-                    requested: tx.amount(),
+                    requested: cost,
                 })?
         }
 
@@ -241,12 +273,20 @@ impl Blockchain {
             if pos > 0 {
                 match block.txs().first() {
                     Some(tx) if tx.is_reward() => {
-                        if tx.amount() != self.mining_reward {
+                        let expected = Self::block_fees(block.txs())
+                            .and_then(|fees| self.mining_reward.checked_add(fees))
+                            .ok_or(ChainError::BadTransaction {
+                                height,
+                                slot: 0,
+                                cause: TxError::AmountOverflow,
+                            })?;
+
+                        if tx.amount() != expected {
                             return Err(ChainError::BadTransaction {
                                 height,
                                 slot: 0,
                                 cause: TxError::WrongReward {
-                                    expected: self.mining_reward,
+                                    expected,
                                     got: tx.amount(),
                                 },
                             });
@@ -323,11 +363,21 @@ mod tests {
     use crate::wallet::Wallet;
 
     fn chain() -> Blockchain {
-        Blockchain::new(8, 50)
+        Blockchain::new(8, 50, 0)
     }
 
     fn signed(from: &Wallet, to: &Wallet, amount: u64, nonce: u64) -> Transaction {
-        Transaction::transfer(from, to.address(), amount, nonce)
+        signed_with_fee(from, to, amount, 0, nonce)
+    }
+
+    fn signed_with_fee(
+        from: &Wallet,
+        to: &Wallet,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Transaction {
+        Transaction::transfer(from, to.address(), amount, fee, nonce)
     }
 
     #[test]
@@ -550,5 +600,156 @@ mod tests {
         assert_eq!(chain.next_nonce(&sender.address()), 3);
         assert_eq!(chain.next_nonce(&receiver.address()), 1);
         assert_eq!(chain.next_nonce(&miner.address()), 0);
+    }
+
+    #[test]
+    fn miner_collects_the_fees_of_a_block() {
+        let mut chain = chain();
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+        let miner = Wallet::from_seed("carol");
+
+        chain.mine_pending(&sender.address());
+        chain
+            .queue_tx(signed_with_fee(&sender, &receiver, 10, 3, 0))
+            .unwrap();
+        chain
+            .queue_tx(signed_with_fee(&sender, &receiver, 5, 2, 1))
+            .unwrap();
+        chain.mine_pending(&miner.address());
+
+        assert_eq!(chain.balance_of(&miner.address()), 55);
+        assert_eq!(chain.balance_of(&sender.address()), 30);
+        assert_eq!(chain.balance_of(&receiver.address()), 15);
+        assert!(chain.validate().is_ok());
+    }
+
+    #[test]
+    fn a_reward_that_ignores_the_block_fees_is_rejected() {
+        let mut chain = chain();
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+        let miner = Wallet::from_seed("carol");
+
+        chain.mine_pending(&sender.address());
+        chain
+            .queue_tx(signed_with_fee(&sender, &receiver, 10, 5, 0))
+            .unwrap();
+        chain.mine_pending(&miner.address());
+
+        chain.blocks[2].txs_mut()[0] = Transaction::reward(miner.address(), 50, 2);
+        for height in 1..chain.blocks.len() {
+            let prev_hash = chain.blocks[height - 1].hash;
+            *chain.blocks[height].prev_hash_mut() = prev_hash;
+            chain.blocks[height].mine(chain.difficulty);
+        }
+
+        assert_eq!(
+            chain.validate(),
+            Err(ChainError::BadTransaction {
+                height: 2,
+                slot: 0,
+                cause: TxError::WrongReward {
+                    expected: 55,
+                    got: 50
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn the_fee_counts_towards_what_a_sender_can_spend() {
+        let mut chain = chain();
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+
+        chain.mine_pending(&sender.address());
+
+        assert_eq!(
+            chain.queue_tx(signed_with_fee(&sender, &receiver, 50, 1, 0)),
+            Err(TxError::InsufficientFunds {
+                available: 50,
+                requested: 51
+            })
+        );
+    }
+
+    #[test]
+    fn pending_fees_reduce_spendable_balance() {
+        let mut chain = chain();
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+
+        chain.mine_pending(&sender.address());
+        chain
+            .queue_tx(signed_with_fee(&sender, &receiver, 10, 4, 0))
+            .unwrap();
+
+        assert_eq!(chain.spendable_balance(&sender.address()), 36);
+    }
+
+    #[test]
+    fn changing_the_fee_after_signing_breaks_the_signature() {
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+
+        let Transaction::Transfer {
+            from,
+            to,
+            amount,
+            nonce,
+            signature,
+            ..
+        } = signed_with_fee(&sender, &receiver, 10, 5, 0)
+        else {
+            unreachable!()
+        };
+
+        let tampered = Transaction::Transfer {
+            from,
+            to,
+            amount,
+            nonce,
+            fee: 1,
+            signature,
+        };
+
+        assert!(matches!(
+            tampered.verify_transfer(),
+            Err(TxError::Signature(_))
+        ));
+    }
+
+    #[test]
+    fn a_fee_below_the_minimum_is_rejected() {
+        let mut chain = Blockchain::new(8, 50, 5);
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+
+        chain.mine_pending(&sender.address());
+
+        assert_eq!(
+            chain.queue_tx(signed_with_fee(&sender, &receiver, 10, 4, 0)),
+            Err(TxError::LowFee { min: 5, got: 4 })
+        );
+        assert!(
+            chain
+                .queue_tx(signed_with_fee(&sender, &receiver, 10, 5, 0))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_amount_plus_fee_that_overflows_is_rejected() {
+        let mut chain = chain();
+        let sender = Wallet::from_seed("alice");
+        let receiver = Wallet::from_seed("bob");
+
+        chain.mine_pending(&sender.address());
+
+        assert_eq!(
+            chain.queue_tx(signed_with_fee(&sender, &receiver, u64::MAX, 1, 0)),
+            Err(TxError::AmountOverflow)
+        );
     }
 }
