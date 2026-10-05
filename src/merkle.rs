@@ -152,8 +152,9 @@ impl MerkleTree {
         }
 
         let mut path = Vec::with_capacity(self.levels.len() - 1);
-        // the tree is always a perfect binary tree due to odd level promotion
-        // hence, number of nodes in next level is half of current level's
+        // a level of n nodes yields ceil(n / 2) parents once pairs are combined
+        // and a lone trailing node is promoted, so the node at `pos` sits at
+        // `pos / 2` in the level above
         let mut pos = index;
 
         // leaves -> root traversal, building a path of sibling hashes along the way

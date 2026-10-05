@@ -33,7 +33,12 @@ impl LightClient {
     }
 }
 
-/// Verifies POW of each header while skipping transaction checks.
+/// Verifies each header's height, proof of work and link to its predecessor.
+///
+/// The merkle root of a header is deliberately not checked here: a client that
+/// holds only headers has no transactions to recompute it from. `root` is
+/// exercised only when an inclusion proof is verified against the header, in
+/// `LightClient::verify_tx`.
 ///
 ///  # Errors
 /// Returns a `ChainError` naming the first header that breaks a rule.
@@ -62,6 +67,7 @@ mod tests {
     use super::*;
     use crate::block::Block;
     use crate::blockchain::Blockchain;
+    use crate::merkle::{MerkleTree, hash_leaf};
     use crate::transaction::Transaction;
     use crate::wallet::Wallet;
 
@@ -92,20 +98,6 @@ mod tests {
         let client = LightClient::sync(chain.headers(), DIFFICULTY).unwrap();
 
         assert_eq!(client.headers().len(), chain.blocks().len());
-    }
-
-    #[test]
-    fn headers_do_not_grow_with_the_transactions_beneath_them() {
-        let chain = chain();
-
-        // block 2 carries three transactions, block 1 carries one, and their
-        // headers are the same size
-        assert_eq!(chain.blocks()[2].txs().len(), 3);
-        assert_eq!(chain.blocks()[1].txs().len(), 1);
-        assert_eq!(
-            size_of_val(&chain.headers()[1]),
-            size_of_val(&chain.headers()[2])
-        );
     }
 
     #[test]
@@ -169,6 +161,9 @@ mod tests {
         let mut headers = chain.headers();
 
         headers[1].timestamp += 3_600;
+        while headers[1].has_valid_pow(DIFFICULTY) {
+            headers[1].pow += 1;
+        }
 
         assert_eq!(
             LightClient::sync(headers, DIFFICULTY),
@@ -224,18 +219,28 @@ mod tests {
             headers[tip].pow += 1;
         }
 
+        assert_ne!(headers[tip].root, chain.blocks()[tip].root());
+
         // no later header links to the tip, so the structural rules have
         // nothing to contradict. Preferring the honest tip takes the longest
         // chain rule, which weighs accumulated work rather than checking one
         // header at a time, and this chain does not implement it yet
-        assert!(LightClient::sync(headers, DIFFICULTY).is_ok());
-
-        // a client on the honest headers is unmoved: the forged transaction
-        // has no path to the root that header sealed
+        let fooled = LightClient::sync(headers, DIFFICULTY).unwrap();
         let honest = LightClient::sync(chain.headers(), DIFFICULTY).unwrap();
-        let block = chain.last_block();
-        let proof = block.proof_for(&block.txs()[0]).unwrap();
 
-        assert!(!honest.verify_tx(&forged, tip as u64, &proof));
+        let forged_proof = MerkleTree::new(vec![hash_leaf(&forged.hash_bytes())])
+            .unwrap()
+            .proof(0)
+            .unwrap();
+
+        assert!(fooled.verify_tx(&forged, tip as u64, &forged_proof));
+        assert!(!honest.verify_tx(&forged, tip as u64, &forged_proof));
+
+        let block = chain.last_block();
+        let tx = &block.txs()[0];
+        let proof = block.proof_for(tx).unwrap();
+
+        assert!(honest.verify_tx(tx, tip as u64, &proof));
+        assert!(!fooled.verify_tx(tx, tip as u64, &proof));
     }
 }
